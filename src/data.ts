@@ -1,4 +1,4 @@
-import type { Confidence, ProjectData, Segment, Tag } from "./types";
+import type { Confidence, ProjectData, Redaction, Segment, Tag } from "./types";
 
 export const uid = (prefix = "id") =>
   `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -8,6 +8,25 @@ export const makeTag = (label: string, type: Tag["type"], color: string): Tag =>
   label,
   type,
   color,
+});
+
+/** 以片段当前正文与时间码为锚点生成一条已确认遮盖 */
+export const makeRedaction = (
+  segment: Pick<Segment, "text" | "start" | "end">,
+  start: number,
+  end: number,
+  reason: string,
+  id = uid("red"),
+): Redaction => ({
+  id,
+  start,
+  end,
+  reason,
+  confirmed: true,
+  anchorText: segment.text,
+  anchorStart: segment.start,
+  anchorEnd: segment.end,
+  createdAt: new Date().toISOString(),
 });
 
 const segment = (
@@ -20,6 +39,7 @@ const segment = (
   flags: Partial<Segment["flags"]> = {},
   tagIds: string[] = [],
   reviewed = false,
+  redactions: Redaction[] = [],
 ): Segment => ({
   id,
   start,
@@ -36,6 +56,7 @@ const segment = (
   },
   tagIds,
   comments: [],
+  redactions,
 });
 
 export const createSeedProject = (): ProjectData => {
@@ -57,6 +78,8 @@ export const createSeedProject = (): ProjectData => {
   ];
   const tags = [...topics, ...events, ...people];
   const byLabel = (label: string) => tags.find((tag) => tag.label === label)?.id ?? "";
+
+  const seg3Text = "我爸爸叫林有德，他原来在宁绍帮的船上做账房，后来日本飞机来了，全家坐小船往闽江上游走。";
 
   return {
     id: "oral-history-1007",
@@ -103,11 +126,12 @@ export const createSeedProject = (): ProjectData => {
             33.8,
             49.6,
             "sp-lin",
-            "我爸爸叫林有德，他原来在宁绍帮的船上做账房，后来日本飞机来了，全家坐小船往闽江上游走。",
+            seg3Text,
             2,
             { lowConfidence: true, properNoun: true },
             [byLabel("家族迁徙"), byLabel("1938 年逃难"), byLabel("林有德")],
             true,
+            [makeRedaction({ text: seg3Text, start: 33.8, end: 49.6 }, 4, 7, "家属要求公开时隐去父亲真实姓名", "red-seed-name")],
           ),
           segment(
             "seg-4",

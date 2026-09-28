@@ -30,6 +30,24 @@ export interface Tag {
   color: string;
 }
 
+export interface Redaction {
+  id: string;
+  /** 基于片段正文 UTF-16 码元的起始偏移（含） */
+  start: number;
+  /** 基于片段正文 UTF-16 码元的结束偏移（不含） */
+  end: number;
+  /** 确认遮盖时填写的原因 */
+  reason: string;
+  /** 是否已由校对员确认；只有确认过的遮盖会进入公开导出 */
+  confirmed: boolean;
+  /** 确认时刻的正文快照，用于在正文变化后让遮盖失效 */
+  anchorText: string;
+  /** 确认时刻的时间码快照，用于在时间码变化后让遮盖失效 */
+  anchorStart: number;
+  anchorEnd: number;
+  createdAt: string;
+}
+
 export interface Segment {
   id: string;
   start: number;
@@ -45,6 +63,7 @@ export interface Segment {
   };
   tagIds: string[];
   comments: ReviewComment[];
+  redactions: Redaction[];
 }
 
 export interface TranscriptTrack {

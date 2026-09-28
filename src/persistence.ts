@@ -11,6 +11,12 @@ export function loadProject(): { project: ProjectData; revision: number } {
   try {
     const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as PersistedEnvelope;
     if (parsed?.schema === 1 && parsed.project?.tracks?.length) {
+      // 旧版本草稿没有遮盖字段，补齐为初始状态，避免渲染时出现 undefined。
+      for (const track of parsed.project.tracks) {
+        for (const segment of track.segments) {
+          segment.redactions ??= [];
+        }
+      }
       return { project: parsed.project, revision: parsed.revision ?? 0 };
     }
   } catch {

@@ -14,10 +14,121 @@ import {
 } from "solid-js";
 import { createSeedProject, uid } from "../data";
 import { downloadText, formatTime, loadProject, parseTime, saveProject } from "../persistence";
-import type { Confidence, PersistedEnvelope, ProjectData, Segment, TranscriptTrack } from "../types";
+import type { Confidence, PersistedEnvelope, ProjectData, Redaction, Segment, TranscriptTrack } from "../types";
 
 const CHANNEL_NAME = "sologsb-1007-editor";
 const TAB_ID = uid("tab");
+
+/** 遮盖仍有效：确认过、范围落在当前正文内，且正文与时间码均与确认时刻一致 */
+function isRedactionLive(redaction: Redaction, segment: Pick<Segment, "text" | "start" | "end">) {
+  return (
+    redaction.confirmed &&
+    redaction.anchorText === segment.text &&
+    Number(redaction.anchorStart) === Number(segment.start) &&
+    Number(redaction.anchorEnd) === Number(segment.end) &&
+    redaction.start >= 0 &&
+    redaction.end <= segment.text.length &&
+    redaction.start < redaction.end
+  );
+}
+
+/** 已确认但因正文或时间码变化而失效，需要重新确认 */
+function isRedactionStale(redaction: Redaction, segment: Pick<Segment, "text" | "start" | "end">) {
+  if (!redaction.confirmed) return false;
+  return !isRedactionLive(redaction, segment);
+}
+
+/** 按当前正文长度夹取范围 */
+const clampRange = (range: { start: number; end: number }, length: number) => {
+  const end = Math.min(range.end, length);
+  const start = Math.max(0, Math.min(range.start, end));
+  return { start, end };
+};
+
+/** 与同片段其他遮盖是否重叠（首尾相接不算重叠）；失效遮盖按夹取后的范围参与比较 */
+function overlapConflict(
+  range: { start: number; end: number },
+  redactions: Redaction[],
+  segment: Pick<Segment, "text" | "start" | "end">,
+  excludeId = "",
+) {
+  return redactions.find((item) => {
+    if (item.id === excludeId) return false;
+    const other = clampRange(item, segment.text.length);
+    if (other.start >= other.end) return false;
+    return range.start < other.end && other.start < range.end;
+  });
+}
+
+/** 把 DOM 选区换算成相对片段正文纯文本的起止偏移 */
+function selectionToOffsets(root: HTMLElement, range: AbstractRange) {
+  if (!root.contains(range.startContainer) || !root.contains(range.endContainer)) return null;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let offset = 0;
+  let start: number | null = null;
+  let end: number | null = null;
+  let node = walker.nextNode();
+  while (node) {
+    const length = node.textContent?.length ?? 0;
+    if (node === range.startContainer) start = offset + range.startOffset;
+    if (node === range.endContainer) end = offset + range.endOffset;
+    offset += length;
+    node = walker.nextNode();
+  }
+  if (start === null || end === null) return null;
+  return start <= end ? { start, end } : { start: end, end: start };
+}
+
+/** 公开文本：把当前有效遮盖合并相邻区间后替换为〔已遮盖〕 */
+function applyRedactions(text: string, redactions: Redaction[], segment: Pick<Segment, "text" | "start" | "end">) {
+  const ranges = redactions
+    .filter((item) => isRedactionLive(item, segment))
+    .map((item) => clampRange(item, text.length))
+    .filter((item) => item.start < item.end)
+    .sort((a, b) => a.start - b.start);
+  const merged: { start: number; end: number }[] = [];
+  for (const range of ranges) {
+    const last = merged.at(-1);
+    if (last && range.start <= last.end) last.end = Math.max(last.end, range.end);
+    else merged.push({ ...range });
+  }
+  if (!merged.length) return text;
+  const parts: string[] = [];
+  let cursor = 0;
+  for (const range of merged) {
+    parts.push(text.slice(cursor, range.start), "〔已遮盖〕");
+    cursor = range.end;
+  }
+  parts.push(text.slice(cursor));
+  return parts.join("");
+}
+
+type RenderMark = { start: number; end: number; redaction: Redaction; status: "confirmed" | "stale" | "draft" };
+
+/** 列表渲染用：把遮盖区间合并成互不重叠的标注段，确认态优先于失效态、失效态优先于草稿态 */
+function buildRenderMarks(segment: Segment): RenderMark[] {
+  const marks = segment.redactions
+    .map((redaction) => {
+      const range = clampRange(redaction, segment.text.length);
+      return { ...range, redaction, status: isRedactionLive(redaction, segment) ? "confirmed" : isRedactionStale(redaction, segment) ? "stale" : "draft" } as RenderMark;
+    })
+    .filter((mark) => mark.start < mark.end);
+  marks.sort((a, b) => a.start - b.start || b.end - a.end);
+  const rank = { confirmed: 3, stale: 2, draft: 1 } as const;
+  const result: RenderMark[] = [];
+  for (const mark of marks) {
+    const top = result.at(-1);
+    if (top && mark.start < top.end) {
+      if (rank[mark.status] > rank[top.status]) {
+        top.redaction = mark.redaction;
+        top.status = mark.status;
+      }
+      continue;
+    }
+    result.push({ ...mark });
+  }
+  return result;
+}
 
 function statusText(status: "saved" | "saving" | "offline") {
   if (status === "saving") return "正在保存";
@@ -50,6 +161,7 @@ function parseTimedTranscript(input: string, trackName: string): TranscriptTrack
         flags: { lowConfidence: false, dialect: false, properNoun: false },
         tagIds: [],
         comments: [],
+        redactions: [],
       });
       continue;
     }
@@ -70,6 +182,7 @@ function parseTimedTranscript(input: string, trackName: string): TranscriptTrack
         flags: { lowConfidence: false, dialect: false, properNoun: false },
         tagIds: [],
         comments: [],
+        redactions: [],
       });
     }
   }
@@ -87,6 +200,7 @@ function parseTimedTranscript(input: string, trackName: string): TranscriptTrack
         flags: { lowConfidence: false, dialect: false, properNoun: false },
         tagIds: [],
         comments: [],
+        redactions: [],
       });
     });
   }
@@ -115,6 +229,11 @@ export default function OralHistoryEditor() {
   const [commentDraft, setCommentDraft] = createSignal("");
   const [replyDrafts, setReplyDrafts] = createSignal<Record<string, string>>({});
   const [trackFilter, setTrackFilter] = createSignal<"all" | "unreviewed" | "low">("all");
+  const [inspectorTab, setInspectorTab] = createSignal("correct");
+  const [textSelection, setTextSelection] = createSignal<{ segmentId: string; start: number; end: number } | null>(null);
+  const [bubblePos, setBubblePos] = createSignal<{ x: number; y: number } | null>(null);
+  const [editorSelection, setEditorSelection] = createSignal<{ start: number; end: number } | null>(null);
+  const [redactionErrors, setRedactionErrors] = createSignal<Record<string, string>>({});
   let editorRef: HTMLTextAreaElement | undefined;
   let fileInputRef: HTMLInputElement | undefined;
   let saveTimer: number | undefined;
@@ -213,16 +332,41 @@ export default function OralHistoryEditor() {
     if (!segment || segment.text.trim().length < 2) return;
     const cursor = editorRef?.selectionStart ?? Math.floor(segment.text.length / 2);
     const safeCursor = Math.max(1, Math.min(cursor, segment.text.length - 1));
-    const firstText = segment.text.slice(0, safeCursor).trim();
-    const secondText = segment.text.slice(safeCursor).trim();
+    const firstTextRaw = segment.text.slice(0, safeCursor);
+    const secondTextRaw = segment.text.slice(safeCursor);
+    const firstText = firstTextRaw.trim();
+    const secondText = secondTextRaw.trim();
     if (!firstText || !secondText) return;
-    const ratio = firstText.length / segment.text.length;
+    const ratio = firstTextRaw.length / segment.text.length;
     const boundary = segment.start + (segment.end - segment.start) * ratio;
     const secondId = uid("seg");
+    // 遮盖按字符位置拆分平移；两端文字与时间码均已改变，原确认状态会自动失效。
+    const firstLead = firstTextRaw.length - firstText.length;
+    const secondLead = secondTextRaw.length - secondText.length;
+    const firstRedactions: Redaction[] = [];
+    const secondRedactions: Redaction[] = [];
+    for (const redaction of segment.redactions) {
+      const moved = { ...redaction };
+      if (redaction.end <= safeCursor) {
+        moved.start -= firstLead;
+        moved.end -= firstLead;
+        firstRedactions.push(moved);
+      } else if (redaction.start >= safeCursor) {
+        moved.start = moved.start - safeCursor - secondLead;
+        moved.end = moved.end - safeCursor - secondLead;
+        secondRedactions.push(moved);
+      } else {
+        // 跨界遮盖截到首段尾部，交由校对员重新确认。
+        moved.start -= firstLead;
+        moved.end = firstText.length;
+        firstRedactions.push(moved);
+      }
+    }
     commitSegment("拆分片段", (current, draft) => {
       const original = structuredClone(current);
       current.text = firstText;
       current.end = Number(boundary.toFixed(1));
+      current.redactions = firstRedactions;
       const trackIndex = draft.tracks.findIndex((track) => track.id === draft.activeTrackId);
       if (trackIndex >= 0) {
         const segmentIndex = draft.tracks[trackIndex].segments.findIndex((item) => item.id === current.id);
@@ -233,6 +377,7 @@ export default function OralHistoryEditor() {
           text: secondText,
           reviewed: false,
           comments: [],
+          redactions: secondRedactions,
         });
       }
       setSelectedId(secondId);
@@ -246,11 +391,19 @@ export default function OralHistoryEditor() {
     const index = track.segments.findIndex((item) => item.id === segment.id);
     const next = track.segments[index + 1];
     if (!next) return;
+    const firstPart = `${segment.text.trim()} `;
+    // 下一段的遮盖偏移随合并后的文字平移；合并后正文/时间码与旧锚点不同，遮盖统一失效待确认。
+    const shiftedNextRedactions = next.redactions.map((redaction) => ({
+      ...redaction,
+      start: redaction.start + firstPart.length,
+      end: redaction.end + firstPart.length,
+    }));
     commitSegment("合并下一片段", (current, draft) => {
       current.text = `${current.text.trim()} ${next.text.trim()}`;
       current.end = next.end;
       current.tagIds = [...new Set([...current.tagIds, ...next.tagIds])];
       current.comments.push(...next.comments);
+      current.redactions = [...current.redactions, ...shiftedNextRedactions];
       current.confidence = Math.min(current.confidence, next.confidence) as Confidence;
       const sourceTrack = draft.tracks.find((item) => item.id === draft.activeTrackId);
       sourceTrack?.segments.splice(index + 1, 1);
@@ -321,12 +474,155 @@ export default function OralHistoryEditor() {
     });
   };
 
-  const exportSrt = () => {
-    const lines = activeTrack().segments.map((segment, index) => {
-      const speaker = speakerById(segment.speakerId)?.name ?? "未知";
-      return `${index + 1}\n${formatTime(segment.start)} --> ${formatTime(segment.end)}\n${speaker}：${segment.text}\n`;
+  const clearRedactionError = (segmentId: string) => {
+    setRedactionErrors((errors) => {
+      if (!errors[segmentId]) return errors;
+      const next = { ...errors };
+      delete next[segmentId];
+      return next;
     });
-    downloadText(`${project().title}-${activeTrack().name}.srt`, lines.join("\n"), "application/x-subrip;charset=utf-8");
+  };
+
+  /** 从选区划出一段遮盖范围；与其他遮盖重叠时拒绝保存并指出冲突 */
+  const beginRedaction = (segmentId: string, range: { start: number; end: number }) => {
+    const track = project().tracks.find((item) => item.id === project().activeTrackId);
+    const target = track?.segments.find((item) => item.id === segmentId);
+    if (!track || !target || range.start >= range.end) return;
+    const safe = clampRange(range, target.text.length);
+    if (safe.start >= safe.end) return;
+    const conflictItem = overlapConflict(safe, target.redactions, target);
+    if (conflictItem) {
+      const conflictRange = clampRange(conflictItem, target.text.length);
+      const conflictIndex = target.redactions.indexOf(conflictItem) + 1;
+      const preview = target.text.slice(conflictRange.start, Math.min(conflictRange.end, conflictRange.start + 12));
+      setRedactionErrors((errors) => ({
+        ...errors,
+        [segmentId]: `与第 ${conflictIndex} 处遮盖范围（“${preview}…”）重叠，请先调整或删除冲突范围。`,
+      }));
+      setLastAction("遮盖范围重叠，已拒绝保存");
+      return;
+    }
+    commit("划出遮盖范围", (draft) => {
+      const current = draft.tracks
+        .find((item) => item.id === draft.activeTrackId)
+        ?.segments.find((item) => item.id === segmentId);
+      current?.redactions.push({
+        id: uid("red"),
+        start: safe.start,
+        end: safe.end,
+        reason: "",
+        confirmed: false,
+        anchorText: "",
+        anchorStart: 0,
+        anchorEnd: 0,
+        createdAt: new Date().toISOString(),
+      });
+    });
+    clearRedactionError(segmentId);
+    setSelectedId(segmentId);
+    setInspectorTab("redact");
+    setTextSelection(null);
+    setBubblePos(null);
+    setEditorSelection(null);
+  };
+
+  const beginRedactionFromList = () => {
+    const selection = textSelection();
+    if (!selection) return;
+    beginRedaction(selection.segmentId, selection);
+  };
+
+  const beginRedactionFromEditor = () => {
+    const segment = activeSegment();
+    const selection = editorSelection();
+    if (!segment || !selection) return;
+    beginRedaction(segment.id, selection);
+  };
+
+  const confirmRedaction = (redactionId: string) => {
+    const segmentId = selectedId();
+    const track = project().tracks.find((item) => item.id === project().activeTrackId);
+    const target = track?.segments.find((item) => item.id === segmentId);
+    if (!track || !target) return;
+    const redaction = target.redactions.find((item) => item.id === redactionId);
+    if (!redaction) return;
+    if (!redaction.reason.trim()) {
+      setRedactionErrors((errors) => ({ ...errors, [segmentId]: "请先填写遮盖原因，再确认保存。" }));
+      return;
+    }
+    const safe = clampRange(redaction, target.text.length);
+    if (safe.start >= safe.end) {
+      setRedactionErrors((errors) => ({ ...errors, [segmentId]: "遮盖范围已超出当前正文，请删除后重新划出。" }));
+      return;
+    }
+    const conflictItem = overlapConflict(safe, target.redactions, target, redactionId);
+    if (conflictItem) {
+      const conflictIndex = target.redactions.indexOf(conflictItem) + 1;
+      setRedactionErrors((errors) => ({
+        ...errors,
+        [segmentId]: `与第 ${conflictIndex} 处遮盖范围重叠，无法确认，请先消除冲突。`,
+      }));
+      setLastAction("遮盖范围重叠，已拒绝确认");
+      return;
+    }
+    commit("确认遮盖范围", (draft) => {
+      const current = draft.tracks
+        .find((item) => item.id === draft.activeTrackId)
+        ?.segments.find((item) => item.id === segmentId);
+      const item = current?.redactions.find((entry) => entry.id === redactionId);
+      if (!current || !item) return;
+      item.start = safe.start;
+      item.end = safe.end;
+      item.confirmed = true;
+      item.anchorText = current.text;
+      item.anchorStart = current.start;
+      item.anchorEnd = current.end;
+    });
+    clearRedactionError(segmentId);
+  };
+
+  const deleteRedaction = (redactionId: string) => {
+    const segmentId = selectedId();
+    commit("删除遮盖范围", (draft) => {
+      const current = draft.tracks
+        .find((item) => item.id === draft.activeTrackId)
+        ?.segments.find((item) => item.id === segmentId);
+      if (!current) return;
+      current.redactions = current.redactions.filter((item) => item.id !== redactionId);
+    });
+    clearRedactionError(segmentId);
+  };
+
+  const editRedactionReason = (redactionId: string, reason: string) => {
+    const segmentId = selectedId();
+    commit("更新遮盖原因", (draft) => {
+      const current = draft.tracks
+        .find((item) => item.id === draft.activeTrackId)
+        ?.segments.find((item) => item.id === segmentId);
+      const item = current?.redactions.find((entry) => entry.id === redactionId);
+      if (item) item.reason = reason;
+    });
+  };
+
+  const buildSrt = (publicExport: boolean) => {
+    const track = activeTrack();
+    return track.segments
+      .map((segment, index) => {
+        const speaker = speakerById(segment.speakerId)?.name ?? "未知";
+        const body = publicExport ? applyRedactions(segment.text, segment.redactions, segment) : segment.text;
+        return `${index + 1}\n${formatTime(segment.start)} --> ${formatTime(segment.end)}\n${speaker}：${body}\n`;
+      })
+      .join("\n");
+  };
+
+  const exportSrt = () => {
+    downloadText(`${project().title}-${activeTrack().name}.srt`, buildSrt(false), "application/x-subrip;charset=utf-8");
+    setLastAction("已导出普通 SRT（保留原话）");
+  };
+
+  const exportPublicSrt = () => {
+    downloadText(`${project().title}-${activeTrack().name}-公开.srt`, buildSrt(true), "application/x-subrip;charset=utf-8");
+    setLastAction("已导出公开 SRT（已遮盖范围替换为〔已遮盖〕）");
   };
 
   const importFile = async (file: File) => {
@@ -359,6 +655,59 @@ export default function OralHistoryEditor() {
       dirty = true;
     }
     setConflict(null);
+  };
+
+  const syncBubbleFromSelection = () => {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+      setBubblePos(null);
+      return;
+    }
+    const rect = selection.getRangeAt(0).getBoundingClientRect();
+    if (!rect || (rect.width === 0 && rect.height === 0)) {
+      setBubblePos(null);
+      return;
+    }
+    setBubblePos({ x: rect.left + rect.width / 2, y: rect.top });
+  };
+
+  const handleSelectionChange = () => {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+      setTextSelection(null);
+      setBubblePos(null);
+      return;
+    }
+    const range = selection.getRangeAt(0);
+    const root = (range.startContainer.nodeType === Node.ELEMENT_NODE
+      ? (range.startContainer as HTMLElement)
+      : range.startContainer.parentElement)?.closest("[data-segment-text]") as HTMLElement | null;
+    if (!root || !root.contains(range.endContainer)) {
+      setTextSelection(null);
+      setBubblePos(null);
+      return;
+    }
+    const offsets = selectionToOffsets(root, range);
+    if (!offsets || offsets.start >= offsets.end) {
+      setTextSelection(null);
+      setBubblePos(null);
+      return;
+    }
+    setTextSelection({ segmentId: root.dataset.segmentText ?? "", ...offsets });
+    syncBubbleFromSelection();
+  };
+
+  const syncEditorSelection = () => {
+    const editor = editorRef;
+    if (!editor || document.activeElement !== editor) {
+      setEditorSelection(null);
+      return;
+    }
+    if (editor.selectionStart < editor.selectionEnd) {
+      setEditorSelection({ start: editor.selectionStart, end: editor.selectionEnd });
+    } else {
+      setEditorSelection(null);
+    }
   };
 
   onMount(() => {
@@ -413,17 +762,29 @@ export default function OralHistoryEditor() {
     window.addEventListener("offline", handleOffline);
     window.addEventListener("storage", handleStorage);
     window.addEventListener("keydown", handleKeydown);
+    document.addEventListener("selectionchange", handleSelectionChange);
+    window.addEventListener("scroll", syncBubbleFromSelection, true);
+    window.addEventListener("resize", syncBubbleFromSelection);
     setOnline(navigator.onLine);
     onCleanup(() => {
       window.removeEventListener("online", handleOnline);
       window.removeEventListener("offline", handleOffline);
       window.removeEventListener("storage", handleStorage);
       window.removeEventListener("keydown", handleKeydown);
+      document.removeEventListener("selectionchange", handleSelectionChange);
+      window.removeEventListener("scroll", syncBubbleFromSelection, true);
+      window.removeEventListener("resize", syncBubbleFromSelection);
     });
   });
 
   channel?.addEventListener("message", (event: MessageEvent<PersistedEnvelope>) => {
     if (event.data.tabId !== TAB_ID && event.data.revision > revision()) setConflict(event.data);
+  });
+
+  // 切换片段时清掉上一个片段 textarea 的选区缓存，避免“遮盖选中”串段。
+  createEffect(() => {
+    selectedId();
+    setEditorSelection(null);
   });
 
   createEffect(() => {
@@ -454,6 +815,22 @@ export default function OralHistoryEditor() {
 
   return (
     <div class="app-shell">
+      <Show when={textSelection() && bubblePos()}>
+        {(getSelectionInfo) => (
+          <button
+            class="selection-bubble"
+            style={{
+              left: `${getSelectionInfo()!.x}px`,
+              top: `${getSelectionInfo()!.y - 8}px`,
+            }}
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={beginRedactionFromList}
+          >
+            ⛿ 遮盖所选
+          </button>
+        )}
+      </Show>
+
       <Show when={conflict()}>
         {(incoming) => (
           <div class="conflict-banner" role="alert">
@@ -490,7 +867,8 @@ export default function OralHistoryEditor() {
           <button class="icon-btn" title="撤销 Ctrl/Cmd+Z" disabled={!past().length} onClick={undo}>↶</button>
           <button class="icon-btn" title="重做 Ctrl/Cmd+Shift+Z" disabled={!future().length} onClick={redo}>↷</button>
           <button class="btn btn-quiet" onClick={() => setHelpOpen(true)}>快捷键 <kbd>?</kbd></button>
-          <button class="btn btn-primary" onClick={exportSrt}>导出 SRT</button>
+          <button class="btn btn-quiet" title="普通导出：保留原话，供内部校对与草稿使用" onClick={exportSrt}>导出 SRT</button>
+          <button class="btn btn-primary" title="公开导出：已确认遮盖范围替换为〔已遮盖〕" onClick={exportPublicSrt}>导出公开 SRT</button>
         </div>
       </header>
 
@@ -580,9 +958,41 @@ export default function OralHistoryEditor() {
                       <Show when={segment.flags.lowConfidence}><span class="pill alert">低置信</span></Show>
                       <Show when={segment.flags.dialect}><span class="pill dialect">方言</span></Show>
                       <Show when={segment.flags.properNoun}><span class="pill proper">专名</span></Show>
+                      <Show when={segment.redactions.some((item) => isRedactionLive(item, segment))}><span class="pill redacted">⛿ 已遮盖 {segment.redactions.filter((item) => isRedactionLive(item, segment)).length}</span></Show>
+                      <Show when={segment.redactions.some((item) => isRedactionStale(item, segment))}><span class="pill redaction-stale">遮盖待确认</span></Show>
                       <Show when={segment.reviewed}><span class="pill done">✓ 已校对</span></Show>
                     </div>
-                    <p>{segment.text}</p>
+                    <p data-segment-text={segment.id}>
+                      {(() => {
+                        const marks = buildRenderMarks(segment);
+                        const pieces: { text: string; mark?: RenderMark }[] = [];
+                        let cursor = 0;
+                        for (const mark of marks) {
+                          if (mark.start > cursor) pieces.push({ text: segment.text.slice(cursor, mark.start) });
+                          pieces.push({ text: segment.text.slice(mark.start, mark.end), mark });
+                          cursor = mark.end;
+                        }
+                        if (cursor < segment.text.length) pieces.push({ text: segment.text.slice(cursor) });
+                        return pieces.map((piece) =>
+                          piece.mark ? (
+                            <mark
+                              class={`redaction-mark ${piece.mark.status}`}
+                              title={
+                                piece.mark.status === "confirmed"
+                                  ? `已确认遮盖：${piece.mark.redaction.reason}`
+                                  : piece.mark.status === "stale"
+                                    ? "遮盖已失效：正文或时间码已变化，需重新确认"
+                                    : "待确认遮盖：请在右侧填写原因并确认"
+                              }
+                            >
+                              {piece.text}
+                            </mark>
+                          ) : (
+                            <span>{piece.text}</span>
+                          ),
+                        );
+                      })()}
+                    </p>
                     <div class="segment-tags">
                       <For each={segment.tagIds.map(tagById).filter(Boolean)}>
                         {(tag) => <span style={{ "--tag-color": tag!.color } as any}>#{tag!.label}</span>}
@@ -602,10 +1012,16 @@ export default function OralHistoryEditor() {
         <aside class="inspector">
           <Show when={activeSegment()} fallback={<div class="empty-inspector"><b>选择一个片段</b><p>在中间列表点击片段后即可校正发言人、置信度、标记和批注。</p></div>}>
             {(segment) => (
-              <Tabs defaultValue="correct" class="inspector-tabs">
+              <Tabs value={inspectorTab()} onChange={setInspectorTab} class="inspector-tabs">
                 <Tabs.List class="tab-list">
                   <Tabs.Trigger value="correct">校对</Tabs.Trigger>
                   <Tabs.Trigger value="annotate">标注</Tabs.Trigger>
+                  <Tabs.Trigger value="redact">
+                    遮盖{" "}
+                    <span classList={{ "redact-count": segment().redactions.some((item) => isRedactionLive(item, segment())) }}>
+                      {segment().redactions.filter((item) => isRedactionLive(item, segment())).length}
+                    </span>
+                  </Tabs.Trigger>
                   <Tabs.Trigger value="comments">批注 <span>{segment().comments.length}</span></Tabs.Trigger>
                 </Tabs.List>
 
@@ -638,8 +1054,12 @@ export default function OralHistoryEditor() {
                     rows="7"
                     value={segment().text}
                     onChange={(event) => commitSegment("校正转写文本", (item) => { item.text = event.currentTarget.value; item.reviewed = false; })}
+                    onSelect={syncEditorSelection}
+                    onKeyUp={syncEditorSelection}
+                    onMouseUp={syncEditorSelection}
+                    onInput={() => setEditorSelection(null)}
                   />
-                  <div class="textarea-help">光标停在句中后点击“拆分”，系统会保留两侧时间码比例。</div>
+                  <div class="textarea-help">光标停在句中后点击“拆分”，系统会保留两侧时间码比例；选中文字可在“遮盖”页划出公开前要遮蔽的范围。</div>
 
                   <div class="field-label">置信度</div>
                   <div class="confidence-picker" role="radiogroup" aria-label="置信度">
@@ -684,6 +1104,79 @@ export default function OralHistoryEditor() {
                       </button>
                     )}
                   </For>
+                </Tabs.Content>
+
+                <Tabs.Content value="redact" class="tab-content comments-content">
+                  <div class="content-title">
+                    <h3>公开前遮盖</h3>
+                    <p>在片段列表或上方转写文本中选中要遮蔽的文字，划出范围后填写原因并确认。仅“导出公开 SRT”会替换为〔已遮盖〕。</p>
+                  </div>
+
+                  <div class="redaction-compose">
+                    <button
+                      class="wide-action"
+                      disabled={!editorSelection()}
+                      onClick={beginRedactionFromEditor}
+                      title={editorSelection() ? undefined : "请先在上方转写文本中选中文字"}
+                    >
+                      <span>⛿</span> 遮盖选中的 {editorSelection() ? editorSelection()!.end - editorSelection()!.start : 0} 个字
+                    </button>
+                    <Show when={textSelection() && textSelection()!.segmentId !== segment().id}>
+                      <div class="hint">已在列表其他片段选中文字，点击片段旁浮出的“遮盖所选”即可。</div>
+                    </Show>
+                  </div>
+
+                  <Show when={redactionErrors()[segment().id]}>
+                    {(message) => <div class="redaction-error" role="alert">{message()}</div>}
+                  </Show>
+
+                  <div class="redaction-list">
+                    <For
+                      each={[...segment().redactions].sort((a, b) => a.start - b.start)}
+                      fallback={<div class="mini-empty">该片段还没有遮盖范围。选中正文文字后划出第一处。</div>}
+                    >
+                      {(redaction) => {
+                        const live = () => isRedactionLive(redaction, segment());
+                        const stale = () => isRedactionStale(redaction, segment());
+                        const range = () => clampRange(redaction, segment().text.length);
+                        const preview = () =>
+                          range().start < range().end ? segment().text.slice(range().start, range().end) : "（范围已超出当前正文）";
+                        return (
+                          <article class={`redaction-card ${live() ? "live" : stale() ? "stale" : "draft"}`}>
+                            <header>
+                              <span class={`redaction-state ${live() ? "live" : stale() ? "stale" : "draft"}`}>
+                                {live() ? "✓ 已确认" : stale() ? "⚠ 已失效·需重新确认" : "待确认"}
+                              </span>
+                              <button class="resolve-link danger" onClick={() => deleteRedaction(redaction.id)}>删除</button>
+                            </header>
+                            <p class="redaction-quote" title={`字符 ${redaction.start}–${redaction.end}`}>“{preview()}”</p>
+                            <label class="field-label" for={`reason-${redaction.id}`}>遮盖原因</label>
+                            <textarea
+                              id={`reason-${redaction.id}`}
+                              rows="2"
+                              placeholder="例如：家属要求隐去真实姓名…"
+                              value={redaction.reason}
+                              onInput={(event) => editRedactionReason(redaction.id, event.currentTarget.value)}
+                            />
+                            <Show when={stale()}>
+                              <div class="redaction-warning">
+                                片段正文或时间码在确认后发生变化，原有遮盖已失效。核对范围后重新确认，才会进入公开导出。
+                              </div>
+                            </Show>
+                            <Show when={!live()}>
+                              <button
+                                class="btn btn-primary redaction-confirm"
+                                disabled={range().start >= range().end}
+                                onClick={() => confirmRedaction(redaction.id)}
+                              >
+                                {redaction.confirmed ? "重新确认遮盖" : "确认遮盖"}
+                              </button>
+                            </Show>
+                          </article>
+                        );
+                      }}
+                    </For>
+                  </div>
                 </Tabs.Content>
 
                 <Tabs.Content value="comments" class="tab-content comments-content">
