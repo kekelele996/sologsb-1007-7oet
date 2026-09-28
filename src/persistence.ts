@@ -1,8 +1,25 @@
-import { createSeedProject } from "./data";
+import { createSeedProject, uid } from "./data";
 import type { PersistedEnvelope, ProjectData } from "./types";
 
 export const STORAGE_KEY = "sologsb-1007-project-v1";
 export const SESSION_KEY = "sologsb-1007-session";
+
+/** 为旧版本草稿补齐遮盖字段，保证重开页面后结构完整。 */
+export function migrateProject(project: ProjectData): ProjectData {
+  for (const track of project.tracks ?? []) {
+    for (const segment of track.segments ?? []) {
+      if (!Array.isArray(segment.redactions)) segment.redactions = [];
+      for (const redaction of segment.redactions) {
+        redaction.start = Number(redaction.start) || 0;
+        redaction.end = Number(redaction.end) || 0;
+        if (typeof redaction.reason !== "string") redaction.reason = "";
+        if (typeof redaction.confirmed !== "boolean") redaction.confirmed = false;
+        if (!redaction.id) redaction.id = uid("red");
+      }
+    }
+  }
+  return project;
+}
 
 export function loadProject(): { project: ProjectData; revision: number } {
   if (typeof localStorage === "undefined") {
@@ -11,7 +28,7 @@ export function loadProject(): { project: ProjectData; revision: number } {
   try {
     const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as PersistedEnvelope;
     if (parsed?.schema === 1 && parsed.project?.tracks?.length) {
-      return { project: parsed.project, revision: parsed.revision ?? 0 };
+      return { project: migrateProject(parsed.project), revision: parsed.revision ?? 0 };
     }
   } catch {
     // A malformed local draft falls back to the bundled sample.

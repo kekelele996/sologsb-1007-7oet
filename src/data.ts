@@ -1,4 +1,4 @@
-import type { Confidence, ProjectData, Segment, Tag } from "./types";
+import type { Confidence, ProjectData, Redaction, Segment, Tag } from "./types";
 
 export const uid = (prefix = "id") =>
   `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -20,6 +20,7 @@ const segment = (
   flags: Partial<Segment["flags"]> = {},
   tagIds: string[] = [],
   reviewed = false,
+  redactions: Redaction[] = [],
 ): Segment => ({
   id,
   start,
@@ -36,6 +37,7 @@ const segment = (
   },
   tagIds,
   comments: [],
+  redactions,
 });
 
 export const createSeedProject = (): ProjectData => {
@@ -57,6 +59,18 @@ export const createSeedProject = (): ProjectData => {
   ];
   const tags = [...topics, ...events, ...people];
   const byLabel = (label: string) => tags.find((tag) => tag.label === label)?.id ?? "";
+
+  const seg3Text = "我爸爸叫林有德，他原来在宁绍帮的船上做账房，后来日本飞机来了，全家坐小船往闽江上游走。";
+  // 示例：受访者要求公开版本不出现父亲全名，“林有德”三个字已确认遮盖。
+  const seedRedaction: Redaction = {
+    id: "red-seed-name",
+    start: 4,
+    end: 7,
+    reason: "受访者要求公开版本不出现父亲全名",
+    confirmed: true,
+    snapshot: { text: seg3Text, start: 33.8, end: 49.6 },
+    createdAt: "2026-08-19T09:20:00.000Z",
+  };
 
   return {
     id: "oral-history-1007",
@@ -103,11 +117,12 @@ export const createSeedProject = (): ProjectData => {
             33.8,
             49.6,
             "sp-lin",
-            "我爸爸叫林有德，他原来在宁绍帮的船上做账房，后来日本飞机来了，全家坐小船往闽江上游走。",
+            seg3Text,
             2,
             { lowConfidence: true, properNoun: true },
             [byLabel("家族迁徙"), byLabel("1938 年逃难"), byLabel("林有德")],
             true,
+            [seedRedaction],
           ),
           segment(
             "seg-4",

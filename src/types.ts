@@ -7,6 +7,27 @@ export interface Reply {
   createdAt: string;
 }
 
+/** 确认遮盖那一刻片段正文与时间码的快照，用于事后判断遮盖是否失效。 */
+export interface RedactionSnapshot {
+  text: string;
+  start: number;
+  end: number;
+}
+
+export interface Redaction {
+  id: string;
+  /** 相对片段正文的字符偏移区间，左闭右开。 */
+  start: number;
+  end: number;
+  /** 校对员填写的不披露原因。 */
+  reason: string;
+  /** 只有确认过的遮盖才会在公开 SRT 中生效。 */
+  confirmed: boolean;
+  /** 未确认或已失效时为 null。 */
+  snapshot: RedactionSnapshot | null;
+  createdAt: string;
+}
+
 export interface ReviewComment {
   id: string;
   author: string;
@@ -45,6 +66,7 @@ export interface Segment {
   };
   tagIds: string[];
   comments: ReviewComment[];
+  redactions: Redaction[];
 }
 
 export interface TranscriptTrack {
